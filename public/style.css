@@ -15,7 +15,7 @@
 }
 
 .mobile-only {
-    display: none;
+    display: none !important;
     margin-left: auto;
 }
 
@@ -796,9 +796,6 @@ input[type="range"]::-moz-range-thumb {
         display: none;
     }
 
-    .brand-logo {
-        display: none;
-    }
 
     .sidebar {
         position: fixed;
@@ -838,7 +835,7 @@ input[type="range"]::-moz-range-thumb {
         pointer-events: auto;
     }
 
-    .main-player {
+    .main-player.panel {
         position: fixed;
         bottom: 0;
         left: 0;
