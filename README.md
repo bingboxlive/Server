@@ -5,10 +5,14 @@ BingBox is a collaborative music streaming application that allows users to queu
 
 ## Getting Started
 
-You can easily run the project using the Docker Compose example:
-
+1. Rename the example configuration file and edit it as needed:
 ```bash
-docker compose -f compose.yml.example up
+mv compose.yml.example compose.yml
+```
+
+2. Run the project:
+```bash
+docker compose up
 ```
 
 ## Deployment
