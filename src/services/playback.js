@@ -144,9 +144,7 @@ function startPlaybackLoop(room, CHUNK_SIZE) {
         const now = Date.now();
         tickCount++;
 
-        if (now % 1000 < 20) {
-            console.log(`[Room ${room.id}] Buffer: ${room.audioBuffer.length}, FFMPEG Finished: ${room.ffmpegFinished}, Paused: ${room.isPaused}`);
-        }
+
 
         if (now - room.nextAudioTime > 1000) {
             room.nextAudioTime = now;
