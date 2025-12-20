@@ -1,10 +1,16 @@
 const WebSocket = require('ws');
 const { spawn } = require('child_process');
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
 const { broadcastRoomState } = require('../socket/broadcaster');
 const { getVideoInfo } = require('./downloader');
 const { formatDuration } = require('../utils/helpers');
 
 async function playNext(room) {
+    const myRequestId = Date.now() + Math.random();
+    room.currentPlayRequestId = myRequestId;
+
     if (room.currentTrack) {
         room.history.push(room.currentTrack);
         if (room.history.length > 50) room.history.shift();
@@ -47,23 +53,30 @@ async function playNext(room) {
     room.startTime = null;
     broadcastRoomState(room);
 
-    console.log(`[Room ${room.id}] Starting track: ${track.title}`);
+    console.log(`[Room ${room.id}] Starting track: ${track.title} (ReqID: ${myRequestId})`);
 
     if (!track.durationSec || track.durationSec === 0 || track.isSpotifySearch) {
         try {
             console.log(`[Room ${room.id}] Resolving real duration for: ${track.title}`);
-            const info = await getVideoInfo(track.url);
+            const info = await getVideoInfo(track.url, 10);
 
-            let realUrl = info.url || track.url;
+            if (room.currentPlayRequestId !== myRequestId) {
+                console.log(`[Room ${room.id}] Play request ${myRequestId} preempted during metadata resolve. Aborting.`);
+                return;
+            }
+
+            let realUrl = info.webpage_url || info.url || track.url;
             let duration = info.duration;
             let durationString = info.duration_string;
 
             if (info.entries && info.entries.length > 0) {
                 const entry = info.entries[0];
-                realUrl = entry.url || entry.webpage_url || realUrl;
+                realUrl = entry.webpage_url || entry.url || realUrl;
                 duration = entry.duration;
                 durationString = entry.duration_string;
-            } else if (info.webpage_url) {
+            }
+
+            if (info.webpage_url && (!realUrl || realUrl.includes('googlevideo.com'))) {
                 realUrl = info.webpage_url;
             }
 
@@ -81,6 +94,11 @@ async function playNext(room) {
         }
     }
 
+    if (room.currentPlayRequestId !== myRequestId) {
+        console.log(`[Room ${room.id}] Play request ${myRequestId} preempted. Aborting.`);
+        return;
+    }
+
     if (room.ffmpegProcess) {
         room.ffmpegProcess.removeAllListeners('close');
         room.ffmpegProcess.kill();
@@ -94,10 +112,32 @@ async function playNext(room) {
     }
 
     const downloadQueue = require('./download_queue');
-    const ytDlpArgs = ['--cookies', 'cookies.txt', '--js-runtimes', 'node', '-f', 'bestaudio', '-o', '-', track.url];
 
-    // Use queue for stream start to throttle heavy processes and handle 429
-    room.ytDlpProcess = await downloadQueue.add(track.url, 'stream', ytDlpArgs);
+    const tmpDir = path.join(os.tmpdir(), 'bingbox', `${room.id}_${myRequestId}`);
+    if (!fs.existsSync(tmpDir)) {
+        fs.mkdirSync(tmpDir, { recursive: true });
+    }
+
+    const cookiePath = path.resolve('cookies.txt');
+
+    const ytDlpArgs = ['--cookies', cookiePath, '--js-runtimes', 'node', '-f', 'bestaudio/best', '-o', '-', track.url];
+
+    const newProcess = await downloadQueue.add(track.url, 'stream', ytDlpArgs, 10, { cwd: tmpDir });
+
+    if (room.currentPlayRequestId !== myRequestId) {
+        console.log(`[Room ${room.id}] Play request ${myRequestId} preempted after download queue. Killing ghost process.`);
+        if (newProcess && newProcess.kill) {
+            newProcess.kill();
+        }
+        try {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        } catch (e) {
+            console.error(`[Room ${room.id}] Failed to cleanup aborted temp dir:`, e.message);
+        }
+        return;
+    }
+
+    room.ytDlpProcess = newProcess;
 
     room.ytDlpProcess.stdout.on('error', (e) => {
         if (e.code !== 'EPIPE') {
@@ -105,8 +145,19 @@ async function playNext(room) {
         }
     });
 
+    room.ytDlpProcess.stderr.on('data', (d) => {
+        console.error(`[Room ${room.id}] yt-dlp stderr: ${d.toString()}`);
+    });
+
     room.ytDlpProcess.on('close', (code) => {
         console.log(`[Room ${room.id}] yt-dlp exited with code ${code}`);
+        try {
+            if (fs.existsSync(tmpDir)) {
+                fs.rmSync(tmpDir, { recursive: true, force: true });
+            }
+        } catch (cleanupErr) {
+            console.error(`[Room ${room.id}] Failed to cleanup temp dir:`, cleanupErr);
+        }
     });
 
     const ffmpegArgs = [
@@ -117,34 +168,40 @@ async function playNext(room) {
         'pipe:1'
     ];
 
-    room.ffmpegProcess = spawn('ffmpeg', ffmpegArgs);
+    const ffmpegProcess = spawn('ffmpeg', ffmpegArgs);
+    room.ffmpegProcess = ffmpegProcess;
 
-    room.ffmpegProcess.stdin.on('error', (e) => {
+    ffmpegProcess.stdin.on('error', (e) => {
         if (e.code !== 'EPIPE') {
             console.error(`[Room ${room.id}] ffmpeg stdin error:`, e);
         }
     });
 
-    room.ytDlpProcess.stdout.pipe(room.ffmpegProcess.stdin);
+    if (room.ytDlpProcess) {
+        room.ytDlpProcess.stdout.pipe(ffmpegProcess.stdin);
+    }
 
-    room.ffmpegProcess.stderr.on('data', d => {
+    ffmpegProcess.stderr.on('data', d => {
     });
 
     const CHUNK_SIZE = 960;
     const WS_CHUNK_SIZE = 4096;
 
-    room.ffmpegProcess.stdout.on('data', chunk => {
+    ffmpegProcess.stdout.on('data', chunk => {
+        if (room.ffmpegProcess !== ffmpegProcess) return;
+
         room.audioBuffer = Buffer.concat([room.audioBuffer, chunk]);
 
         if (room.audioBuffer.length > room.BUFFER_HIGH_WATER_MARK) {
-            room.ffmpegProcess.stdout.pause();
+            ffmpegProcess.stdout.pause();
         }
     });
 
     room.nextAudioTime = Date.now();
     startPlaybackLoop(room, CHUNK_SIZE);
 
-    room.ffmpegProcess.on('close', (code) => {
+    ffmpegProcess.on('close', (code) => {
+        if (room.ffmpegProcess !== ffmpegProcess) return;
         console.log(`[Room ${room.id}] Ffmpeg process finished. Waiting for buffer drain.`);
         room.ffmpegFinished = true;
     });
@@ -174,14 +231,19 @@ function startPlaybackLoop(room, CHUNK_SIZE) {
 
             clearInterval(room.playbackInterval);
             room.playbackInterval = null;
-            playNext(room);
+
+            const playedDuration = room.startTime ? (Date.now() - room.startTime) : 0;
+            if (playedDuration < 2000) {
+                console.log(`[Room ${room.id}] Track ended too quickly (${playedDuration}ms). Delaying next track by 1000ms.`);
+                setTimeout(() => playNext(room), 1000);
+            } else {
+                playNext(room);
+            }
             return;
         }
 
         const now = Date.now();
         tickCount++;
-
-
 
         if (now - room.nextAudioTime > 1000) {
             room.nextAudioTime = now;

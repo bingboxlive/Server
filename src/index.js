@@ -44,7 +44,6 @@ setInterval(() => {
                 metadataScheduler.roomQueues.delete(roomId);
             }
 
-            // Cleanup SourceResolver
             if (sourceResolver && sourceResolver.activeRooms.has(roomId)) {
                 sourceResolver.activeRooms.delete(roomId);
             }

@@ -4,23 +4,22 @@ class DownloadQueue {
     constructor() {
         this.queue = [];
         this.active = 0;
-        this.maxConcurrent = 3; // Keep this low to avoid strict IP bans
+        this.maxConcurrent = 2;
         this.retryDelay = 5000;
         this.processing = false;
+
+        this.requestTimestamps = [];
+        this.maxRequestsPerSecond = 3;
     }
 
-    /**
-     * @param {string} url - YouTube URL
-     * @param {string} type - 'info' | 'stream'
-     * @param {Array} spawnArgs - Arguments for spawn (only for 'stream')
-     * @returns {Promise}
-     */
-    add(url, type = 'info', spawnArgs = []) {
+    add(url, type = 'info', spawnArgs = [], priority = 0, options = {}) {
         return new Promise((resolve, reject) => {
             const task = {
                 url,
                 type,
                 spawnArgs,
+                priority,
+                options,
                 resolve,
                 reject,
                 addedAt: Date.now(),
@@ -37,11 +36,24 @@ class DownloadQueue {
 
         try {
             while (this.active < this.maxConcurrent && this.queue.length > 0) {
-                // FIFO: Sort by addedAt to ensure oldest get priority
-                this.queue.sort((a, b) => a.addedAt - b.addedAt);
+                const now = Date.now();
+                this.requestTimestamps = this.requestTimestamps.filter(t => now - t < 1000);
+
+                if (this.requestTimestamps.length >= this.maxRequestsPerSecond) {
+                    const oldest = this.requestTimestamps[0];
+                    const waitTime = 1000 - (now - oldest) + 50;
+                    setTimeout(() => this.process(), waitTime);
+                    break;
+                }
+
+                this.queue.sort((a, b) => {
+                    if (a.priority !== b.priority) return b.priority - a.priority;
+                    return a.addedAt - b.addedAt;
+                });
 
                 const task = this.queue.shift();
                 this.active++;
+                this.requestTimestamps.push(Date.now());
 
                 this.execute(task).then(() => {
                     this.active--;
@@ -62,8 +74,6 @@ class DownloadQueue {
                 const result = await this.executeInfo(task);
                 task.resolve(result);
             } else if (task.type === 'stream') {
-                // For streams, we resolve effectively "immediately" once the process starts
-                // The Caller handles the process events
                 const process = this.executeStream(task);
                 task.resolve(process);
             }
@@ -72,7 +82,7 @@ class DownloadQueue {
                 console.log(`[Queue] Task failed with 429/RateLimit. Retrying in ${this.retryDelay / 1000}s... (Attempt ${task.retries + 1})`);
                 task.retries++;
                 setTimeout(() => {
-                    this.queue.unshift(task); // Put back in front
+                    this.queue.unshift(task);
                     this.process();
                 }, this.retryDelay + (Math.random() * 2000));
             } else {
@@ -82,7 +92,6 @@ class DownloadQueue {
     }
 
     shouldRetry(err, task) {
-        // Retry if it's a 429 or "Too Many Requests" message
         if (task.retries > 5) return false;
         if (err.message && (err.message.includes('429') || err.message.includes('Too Many Requests'))) {
             return true;
@@ -99,6 +108,7 @@ class DownloadQueue {
                 '--flat-playlist',
                 '--extractor-args', 'youtubetab:skip=authcheck',
                 '--playlist-end', '100',
+                '--no-cache-dir',
                 task.url
             ]);
 
@@ -123,11 +133,11 @@ class DownloadQueue {
     }
 
     executeStream(task) {
-        // Just spawns and returns the process, caller handles pipes
-        // Note: For streams, if they fail immediately with 429, it might be harder to catch here
-        // without waiting for at least some output. 
-        // But for now, let's assume the rate limit usually hits metadata fetching first.
-        return spawn('yt-dlp', task.spawnArgs);
+        const spawnOptions = {};
+        if (task.options && task.options.cwd) {
+            spawnOptions.cwd = task.options.cwd;
+        }
+        return spawn('yt-dlp', task.spawnArgs, spawnOptions);
     }
 }
 
