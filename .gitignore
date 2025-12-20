@@ -2,3 +2,4 @@ cookies.txt
 node_modules
 compose.yml
 .env
+tests/
