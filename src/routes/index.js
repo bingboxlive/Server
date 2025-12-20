@@ -9,6 +9,7 @@ const { reorderQueue } = require('../services/queue');
 const { broadcastRoomState } = require('../socket/broadcaster');
 const { playNext } = require('../services/playback');
 const { formatDuration } = require('../utils/helpers');
+const { spotifyClient, spotifyScheduler } = require('../services/spotify');
 
 const indexHtmlPath = path.join(__dirname, '../../public', 'index.html');
 const indexHtmlContent = fs.readFileSync(indexHtmlPath, 'utf8');
@@ -62,15 +63,21 @@ router.post('/api/queue', async (req, res) => {
 
     let targetUrl = url;
     let isSearch = false;
+    let isSpotify = false;
 
     try {
         const u = new URL(url);
         const host = u.hostname.toLowerCase();
         const allowedDomains = ['youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be', 'music.youtube.com', 'www.music.youtube.com'];
-        const isYt = allowedDomains.includes(host) || host.endsWith('.youtube.com');
+        const spotifyDomains = ['open.spotify.com', 'spotify.com'];
 
-        if (!isYt) {
-            return res.status(400).json({ error: 'Only YouTube links are supported' });
+        if (spotifyDomains.includes(host) || host.endsWith('.spotify.com')) {
+            isSpotify = true;
+        } else {
+            const isYt = allowedDomains.includes(host) || host.endsWith('.youtube.com');
+            if (!isYt) {
+                return res.status(400).json({ error: 'Only YouTube and Spotify links are supported' });
+            }
         }
     } catch (e) {
         isSearch = true;
@@ -78,6 +85,66 @@ router.post('/api/queue', async (req, res) => {
         console.log(`[Room ${roomId}] Input '${url}' treated as search: ${targetUrl}`);
     }
 
+    if (isSpotify) {
+        try {
+            const u = new URL(url);
+            const pathSegments = u.pathname.split('/').filter(p => p.length > 0);
+            // usually /track/<id> or /playlist/<id>
+
+            const type = pathSegments[0];
+            const id = pathSegments[1];
+
+            if (type === 'track') {
+                const trackData = await spotifyClient.getTrack(id);
+                if (!trackData) return res.status(404).json({ error: 'Spotify track not found' });
+
+                const artist = trackData.artists.map(a => a.name).join(', ');
+                const title = trackData.name;
+                const query = `ytsearch1:${artist} - ${title}`;
+
+                let thumbnail = null;
+                if (trackData.album && trackData.album.images && trackData.album.images.length > 0) {
+                    thumbnail = trackData.album.images[0].url;
+                }
+
+                const track = {
+                    id: 'sp-' + trackData.id + '-' + Date.now(),
+                    url: query,
+                    title: title,
+                    cleanTitle: title,
+                    artist: artist,
+                    duration: '00:00',
+                    durationSec: 0,
+                    thumbnail: thumbnail,
+                    addedBy: userName || 'Anonymous',
+                    addedAt: Date.now(),
+                    isSpotifySearch: true
+                };
+
+                room.queue.push(track);
+                reorderQueue(room);
+                broadcastRoomState(room);
+
+                if (!room.isPlaying) {
+                    playNext(room);
+                }
+
+                return res.json(track);
+
+            } else if (type === 'playlist') {
+                spotifyScheduler.enqueuePlaylist(roomId, id, userName || 'Anonymous');
+                return res.json({ message: 'Spotify playlist queued for background import.' });
+            } else {
+                return res.status(400).json({ error: 'Unsupported Spotify link type (only Track/Playlist)' });
+            }
+
+        } catch (e) {
+            console.error('[Spotify] Error processing URL:', e);
+            return res.status(500).json({ error: 'Failed to process Spotify link' });
+        }
+    }
+
+    // Existing YouTube Logic
     try {
         const info = await getVideoInfo(targetUrl);
 

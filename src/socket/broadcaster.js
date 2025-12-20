@@ -15,6 +15,7 @@ function broadcastRoomState(room) {
         isPaused: room.isPaused,
         startedAt: room.startTime,
         totalPausedDuration: room.totalPausedDuration,
+        serverTime: Date.now(),
         clients: clientList
     });
     room.clients.forEach(client => {
