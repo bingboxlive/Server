@@ -49,18 +49,15 @@ async function playNext(room) {
 
     console.log(`[Room ${room.id}] Starting track: ${track.title}`);
 
-    // Resolve real duration for Spotify searches (or if missing)
     if (!track.durationSec || track.durationSec === 0 || track.isSpotifySearch) {
         try {
             console.log(`[Room ${room.id}] Resolving real duration for: ${track.title}`);
             const info = await getVideoInfo(track.url);
 
-            // Update track with resolved info
             let realUrl = info.url || track.url;
             let duration = info.duration;
             let durationString = info.duration_string;
 
-            // Handle ytsearch result structure (often a playlist with 1 entry)
             if (info.entries && info.entries.length > 0) {
                 const entry = info.entries[0];
                 realUrl = entry.url || entry.webpage_url || realUrl;
@@ -70,16 +67,14 @@ async function playNext(room) {
                 realUrl = info.webpage_url;
             }
 
-            track.url = realUrl; // Use resolved URL to avoid re-searching
-            // Use resolve duration
+            track.url = realUrl;
             if (duration) {
                 track.durationSec = duration;
                 track.duration = durationString || formatDuration(duration);
             }
-            // Update title/artist if missing?? No, keeping Spotify metadata is preferred.
 
             console.log(`[Room ${room.id}] Resolved duration: ${track.duration} (${track.durationSec}s)`);
-            broadcastRoomState(room); // Update client with real duration
+            broadcastRoomState(room);
 
         } catch (e) {
             console.error(`[Room ${room.id}] Failed to resolve metadata:`, e.message);

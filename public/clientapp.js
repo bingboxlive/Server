@@ -257,10 +257,8 @@ function updateUI(data) {
         elements.currentThumbnail.src = data.currentTrack.thumbnail || 'img/bingbong.webp';
         state.currentTrackDurationSec = data.currentTrack.durationSec || 0;
         if (data.startedAt) {
-            // Calculate effective start time in local time frame
             const effectiveServerStart = data.startedAt + (data.totalPausedDuration || 0);
             const elapsedOnServer = (data.serverTime || Date.now()) - effectiveServerStart;
-            // Map to local timeline
             state.currentTrackStartTime = Date.now() - elapsedOnServer;
 
             startProgressLoop(data.isPaused);

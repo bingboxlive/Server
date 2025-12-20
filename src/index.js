@@ -7,6 +7,7 @@ const { rooms } = require('./state/store');
 const { setupWebSocketServer } = require('./socket/index');
 const routes = require('./routes/index');
 const { metadataScheduler } = require('./services/metadata');
+const { sourceResolver } = require('./services/source_resolver');
 
 const app = express();
 const server = http.createServer(app);
@@ -41,6 +42,11 @@ setInterval(() => {
 
             if (metadataScheduler.roomQueues.has(roomId)) {
                 metadataScheduler.roomQueues.delete(roomId);
+            }
+
+            // Cleanup SourceResolver
+            if (sourceResolver && sourceResolver.activeRooms.has(roomId)) {
+                sourceResolver.activeRooms.delete(roomId);
             }
 
             rooms.delete(roomId);

@@ -4,6 +4,7 @@ const { broadcastRoomState } = require('../socket/broadcaster');
 const { sleep } = require('../utils/helpers');
 const { playNext } = require('./playback');
 const { reorderQueue } = require('./queue');
+const { sourceResolver } = require('./source_resolver');
 
 class SpotifyClient {
     constructor() {
@@ -37,7 +38,7 @@ class SpotifyClient {
             });
 
             this.accessToken = res.data.access_token;
-            this.tokenExpiresAt = Date.now() + (res.data.expires_in * 1000) - 60000; // buffer 1 min
+            this.tokenExpiresAt = Date.now() + (res.data.expires_in * 1000) - 60000;
             console.log('[Spotify] New access token acquired.');
             return this.accessToken;
         } catch (e) {
@@ -70,9 +71,109 @@ class SpotifyClient {
                 headers: { 'Authorization': `Bearer ${token}` },
                 params: { offset, limit }
             });
-            return res.data; // { items: [], next: 'url' }
+            return res.data;
         } catch (e) {
             console.error('[Spotify] getPlaylistTracks failed:', e.message);
+            return null;
+        }
+    }
+
+    async searchPlaylist(query) {
+        const token = await this.getToken();
+        if (!token) throw new Error('No Spotify token');
+
+        console.log(`[Spotify] Searching for playlist: "${query}"`);
+
+        try {
+            const res = await axios.get('https://api.spotify.com/v1/search', {
+                headers: { 'Authorization': `Bearer ${token}` },
+                params: {
+                    q: query,
+                    type: 'playlist',
+                    limit: 5,
+                    market: 'US'
+                }
+            });
+
+            console.log('[Spotify] Search response status:', res.status);
+            if (res.data && res.data.playlists) {
+                const items = res.data.playlists.items.filter(i => i !== null);
+                console.log(`[Spotify] Found ${res.data.playlists.items.length} raw results, ${items.length} valid playlists for query "${query}"`);
+
+                if (items.length > 0) {
+                    const first = items[0];
+                    console.log(`[Spotify] First match: "${first.name}" (ID: ${first.id})`);
+                    return first;
+                } else {
+                    console.warn(`[Spotify] Search returned 0 valid results for "${query}"`);
+                }
+            } else {
+                console.log('[Spotify] invalid response format:', Object.keys(res.data));
+            }
+            return null;
+        } catch (e) {
+            console.error('[Spotify] searchPlaylist failed:', e.message);
+            if (e.response) {
+                console.error('[Spotify] API Error Data:', JSON.stringify(e.response.data));
+            }
+            return null;
+        }
+    }
+
+    async getAlbumTracks(albumId, offset = 0, limit = 50) {
+        const token = await this.getToken();
+        if (!token) throw new Error('No Spotify token');
+
+        try {
+            const res = await axios.get(`https://api.spotify.com/v1/albums/${albumId}/tracks`, {
+                headers: { 'Authorization': `Bearer ${token}` },
+                params: { offset, limit }
+            });
+            return res.data;
+        } catch (e) {
+            console.error('[Spotify] getAlbumTracks failed:', e.message);
+            return null;
+        }
+    }
+
+    async searchAlbum(query) {
+        const token = await this.getToken();
+        if (!token) throw new Error('No Spotify token');
+
+        console.log(`[Spotify] Searching for album: "${query}"`);
+
+        try {
+            const res = await axios.get('https://api.spotify.com/v1/search', {
+                headers: { 'Authorization': `Bearer ${token}` },
+                params: {
+                    q: query,
+                    type: 'album',
+                    limit: 5,
+                    market: 'US'
+                }
+            });
+
+            console.log('[Spotify] Album Search response status:', res.status);
+            if (res.data && res.data.albums) {
+                const items = res.data.albums.items.filter(i => i !== null);
+                console.log(`[Spotify] Found ${res.data.albums.items.length} raw results, ${items.length} valid albums for query "${query}"`);
+
+                if (items.length > 0) {
+                    const first = items[0];
+                    console.log(`[Spotify] First match: "${first.name}" (ID: ${first.id})`);
+                    return first;
+                } else {
+                    console.warn(`[Spotify] Album Search returned 0 valid results for "${query}"`);
+                }
+            } else {
+                console.log('[Spotify] invalid response format:', Object.keys(res.data));
+            }
+            return null;
+        } catch (e) {
+            console.error('[Spotify] searchAlbum failed:', e.message);
+            if (e.response) {
+                console.error('[Spotify] API Error Data:', JSON.stringify(e.response.data));
+            }
             return null;
         }
     }
@@ -81,25 +182,27 @@ class SpotifyClient {
 class SpotifyScheduler {
     constructor(client) {
         this.client = client;
-        this.jobs = new Map(); // roomId -> [{ playlistId, offset, total, userName }]
+        this.jobs = new Map();
         this.roomOrder = [];
         this.isProcessing = false;
         this.BATCH_SIZE = 50;
     }
 
-    enqueuePlaylist(roomId, playlistId, userName) {
+    enqueueCollection(roomId, id, type, userName, thumbnail = null) {
         if (!this.jobs.has(roomId)) {
             this.jobs.set(roomId, []);
             this.roomOrder.push(roomId);
         }
 
         this.jobs.get(roomId).push({
-            playlistId,
+            id,
+            type: type || 'playlist',
             offset: 0,
-            userName
+            userName,
+            thumbnail
         });
 
-        console.log(`[Spotify] Playlist ${playlistId} queued for Room ${roomId}`);
+        console.log(`[Spotify] ${type} ${id} queued for Room ${roomId}`);
         this.start();
     }
 
@@ -121,11 +224,10 @@ class SpotifyScheduler {
 
         if (!roomJobs || roomJobs.length === 0) {
             this.jobs.delete(roomId);
-            // Dont re-push roomId
             return this.processNext();
         }
 
-        const job = roomJobs[0]; // Peek
+        const job = roomJobs[0];
         const room = rooms.get(roomId);
 
         if (!room) {
@@ -135,14 +237,20 @@ class SpotifyScheduler {
         }
 
         try {
-            console.log(`[Spotify] Processing batch for Room ${roomId} (Offset: ${job.offset})`);
-            const data = await this.client.getPlaylistTracks(job.playlistId, job.offset, this.BATCH_SIZE);
+            console.log(`[Spotify] Processing batch for Room ${roomId} (Type: ${job.type}, Offset: ${job.offset})`);
+
+            let data = null;
+            if (job.type === 'album') {
+                data = await this.client.getAlbumTracks(job.id, job.offset, this.BATCH_SIZE);
+            } else {
+                data = await this.client.getPlaylistTracks(job.id, job.offset, this.BATCH_SIZE);
+            }
 
             if (data && data.items && data.items.length > 0) {
                 const newTracks = [];
 
                 data.items.forEach(item => {
-                    const track = item.track;
+                    const track = (job.type === 'album') ? item : item.track;
                     if (!track || !track.id) return;
 
                     const artist = track.artists.map(a => a.name).join(', ');
@@ -150,22 +258,24 @@ class SpotifyScheduler {
                     const query = `ytsearch1:${artist} - ${title}`;
 
                     let thumbnail = null;
-                    if (track.album && track.album.images && track.album.images.length > 0) {
+                    if (job.type === 'album') {
+                        thumbnail = job.thumbnail;
+                    } else if (track.album && track.album.images && track.album.images.length > 0) {
                         thumbnail = track.album.images[0].url;
                     }
 
                     newTracks.push({
-                        id: 'sp-' + track.id + '-' + Date.now(), // unique ID
+                        id: 'sp-' + track.id + '-' + Date.now(),
                         url: query,
                         title: title,
                         cleanTitle: title,
                         artist: artist,
-                        duration: '00:00', // Unknown until yt-dlp resolves it
+                        duration: '00:00',
                         durationSec: 0,
                         thumbnail: thumbnail,
                         addedBy: job.userName,
                         addedAt: Date.now(),
-                        isSpotifySearch: true // flag for frontend/backend if needed
+                        isSpotifySearch: true
                     });
                 });
 
@@ -173,19 +283,19 @@ class SpotifyScheduler {
                 reorderQueue(room);
                 broadcastRoomState(room);
 
+                sourceResolver.notifyRoom(roomId);
+
                 if (!room.isPlaying) {
                     playNext(room);
                 }
 
-                // Check if more
                 if (data.next) {
                     job.offset += this.BATCH_SIZE;
-                    // Move this room to back of line
                     this.roomOrder.push(roomId);
                 } else {
-                    console.log(`[Spotify] Finished playlist ${job.playlistId} for Room ${roomId}`);
-                    roomJobs.shift(); // Done
-                    this.roomOrder.push(roomId); // In case there are more jobs for this room
+                    console.log(`[Spotify] Finished ${job.type} ${job.id} for Room ${roomId}`);
+                    roomJobs.shift();
+                    this.roomOrder.push(roomId);
                 }
 
             } else {
@@ -198,7 +308,6 @@ class SpotifyScheduler {
             roomJobs.shift();
         }
 
-        // Rate Limit delay
         await sleep(500);
         this.processNext();
     }

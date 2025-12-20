@@ -10,6 +10,7 @@ const { broadcastRoomState } = require('../socket/broadcaster');
 const { playNext } = require('../services/playback');
 const { formatDuration } = require('../utils/helpers');
 const { spotifyClient, spotifyScheduler } = require('../services/spotify');
+const { sourceResolver } = require('../services/source_resolver');
 
 const indexHtmlPath = path.join(__dirname, '../../public', 'index.html');
 const indexHtmlContent = fs.readFileSync(indexHtmlPath, 'utf8');
@@ -81,15 +82,67 @@ router.post('/api/queue', async (req, res) => {
         }
     } catch (e) {
         isSearch = true;
-        targetUrl = `ytsearch1:${url}`;
-        console.log(`[Room ${roomId}] Input '${url}' treated as search: ${targetUrl}`);
+
+        if (url.toLowerCase().startsWith('[yp]')) {
+            const query = url.slice(4).trim();
+            const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}&sp=EgIQAw%253D%253D`;
+            console.log(`[Room ${roomId}] [yp] detected. Searching YouTube Playlist: ${query}`);
+
+            try {
+                targetUrl = searchUrl;
+
+            } catch (err) {
+                console.error('Error constructing [yp] search:', err);
+                return res.status(500).json({ error: 'Failed to search YouTube playlist' });
+            }
+
+        } else if (url.toLowerCase().startsWith('[sp]') || url.toLowerCase().startsWith('[p]')) {
+            const prefixLen = url.toLowerCase().startsWith('[sp]') ? 4 : 3;
+            const query = url.slice(prefixLen).trim();
+            console.log(`[Room ${roomId}] [sp]/[p] detected. Searching Spotify Playlist: ${query}`);
+
+            try {
+                const playlist = await spotifyClient.searchPlaylist(query);
+                if (playlist) {
+                    spotifyScheduler.enqueueCollection(roomId, playlist.id, 'playlist', userName || 'Anonymous');
+                    return res.json({ message: `Found Spotify playlist: "${playlist.name}". Queued for background import.` });
+                } else {
+                    return res.status(404).json({ error: 'No Spotify playlist found for that query' });
+                }
+            } catch (err) {
+                console.error('Error searching Spotify:', err);
+                return res.status(500).json({ error: 'Failed to search Spotify playlist' });
+            }
+        } else if (url.toLowerCase().startsWith('[sa]') || url.toLowerCase().startsWith('[a]')) {
+            const prefixLen = url.toLowerCase().startsWith('[sa]') ? 4 : 3;
+            const query = url.slice(prefixLen).trim();
+            console.log(`[Room ${roomId}] [sa]/[a] detected. Searching Spotify Album: ${query}`);
+
+            try {
+                const album = await spotifyClient.searchAlbum(query);
+                if (album) {
+                    let thumb = null;
+                    if (album.images && album.images.length > 0) thumb = album.images[0].url;
+
+                    spotifyScheduler.enqueueCollection(roomId, album.id, 'album', userName || 'Anonymous', thumb);
+                    return res.json({ message: `Found Spotify album: "${album.name}". Queued for background import.` });
+                } else {
+                    return res.status(404).json({ error: 'No Spotify album found for that query' });
+                }
+            } catch (err) {
+                console.error('Error searching Spotify Album:', err);
+                return res.status(500).json({ error: 'Failed to search Spotify album' });
+            }
+        } else {
+            targetUrl = `ytsearch1:${url}`;
+            console.log(`[Room ${roomId}] Input '${url}' treated as search: ${targetUrl}`);
+        }
     }
 
     if (isSpotify) {
         try {
             const u = new URL(url);
             const pathSegments = u.pathname.split('/').filter(p => p.length > 0);
-            // usually /track/<id> or /playlist/<id>
 
             const type = pathSegments[0];
             const id = pathSegments[1];
@@ -125,6 +178,8 @@ router.post('/api/queue', async (req, res) => {
                 reorderQueue(room);
                 broadcastRoomState(room);
 
+                sourceResolver.notifyRoom(roomId);
+
                 if (!room.isPlaying) {
                     playNext(room);
                 }
@@ -132,7 +187,7 @@ router.post('/api/queue', async (req, res) => {
                 return res.json(track);
 
             } else if (type === 'playlist') {
-                spotifyScheduler.enqueuePlaylist(roomId, id, userName || 'Anonymous');
+                spotifyScheduler.enqueueCollection(roomId, id, 'playlist', userName || 'Anonymous');
                 return res.json({ message: 'Spotify playlist queued for background import.' });
             } else {
                 return res.status(400).json({ error: 'Unsupported Spotify link type (only Track/Playlist)' });
@@ -144,9 +199,20 @@ router.post('/api/queue', async (req, res) => {
         }
     }
 
-    // Existing YouTube Logic
     try {
         const info = await getVideoInfo(targetUrl);
+
+        if (targetUrl.includes('youtube.com/results') && info.entries && info.entries.length > 0) {
+            const firstResult = info.entries[0];
+            if (firstResult.url) {
+                console.log(`[Room ${roomId}] [yp] Search found playlist: ${firstResult.title} (${firstResult.url})`);
+                const playlistUrl = firstResult.url;
+                const playlistInfo = await getVideoInfo(playlistUrl);
+
+                Object.assign(info, playlistInfo);
+            }
+        }
+
 
         const newTracks = [];
 
