@@ -93,8 +93,11 @@ async function playNext(room) {
         room.ytDlpProcess = null;
     }
 
+    const downloadQueue = require('./download_queue');
     const ytDlpArgs = ['--cookies', 'cookies.txt', '--js-runtimes', 'node', '-f', 'bestaudio', '-o', '-', track.url];
-    room.ytDlpProcess = spawn('yt-dlp', ytDlpArgs);
+
+    // Use queue for stream start to throttle heavy processes and handle 429
+    room.ytDlpProcess = await downloadQueue.add(track.url, 'stream', ytDlpArgs);
 
     room.ytDlpProcess.stdout.on('error', (e) => {
         if (e.code !== 'EPIPE') {
